@@ -1,0 +1,33 @@
+name: Flyway migrate (AWS RDS)
+
+# Manual only. The CI workflow (flyway.yml) already proves migrations on a
+# throwaway container; this one applies them to the real RDS instance.
+on:
+  workflow_dispatch:
+    inputs:
+      command:
+        description: Flyway command
+        type: choice
+        options: [info, validate, migrate]
+        default: migrate
+
+jobs:
+  rds:
+    runs-on: ubuntu-latest
+    # Create a GitHub Environment named "rds" (Settings > Environments) and add
+    # required reviewers if you want an approval gate before this job runs.
+    environment: rds
+    env:
+      FLYWAY_URL: ${{ secrets.RDS_JDBC_URL }}
+      FLYWAY_USER: ${{ secrets.RDS_USER }}
+      FLYWAY_PASSWORD: ${{ secrets.RDS_PASSWORD }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Flyway ${{ inputs.command }}
+        run: |
+          docker run --rm \
+            -v ${{ github.workspace }}/sql:/flyway/sql \
+            -v ${{ github.workspace }}/flyway.conf:/flyway/conf/flyway.conf \
+            -e FLYWAY_URL -e FLYWAY_USER -e FLYWAY_PASSWORD \
+            redgate/flyway ${{ inputs.command }}
