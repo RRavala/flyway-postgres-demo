@@ -1,0 +1,107 @@
+name: Flyway deploy (choose environment)
+
+# Manual only. flyway.yml already proves every PR on a throwaway Postgres.
+# This workflow applies the same migrations to a real, long-lived database.
+on:
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: Target environment
+        type: choice
+        options: [dev, stage, prod]
+        default: dev
+      command:
+        description: Flyway command
+        type: choice
+        options: [info, validate, migrate]
+        default: migrate
+
+jobs:
+  # Step 1: rehearse on a throwaway Postgres so a broken migration fails here,
+  # before it ever touches the target environment.
+  verify:
+    name: Verify migrations on throwaway Postgres
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_DB: demo
+          POSTGRES_USER: demo
+          POSTGRES_PASSWORD: demo
+        ports: ["5432:5432"]
+        options: >-
+          --health-cmd "pg_isready -U demo"
+          --health-interval 5s --health-timeout 5s --health-retries 10
+    env:
+      FLYWAY_URL: jdbc:postgresql://localhost:5432/demo
+      FLYWAY_USER: demo
+      FLYWAY_PASSWORD: demo
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Guard - stage and prod deploy only from main
+        if: inputs.environment != 'dev' && github.ref != 'refs/heads/main'
+        run: |
+          echo "::error::${{ inputs.environment }} can only be deployed from main (this run is on ${{ github.ref_name }})."
+          exit 1
+
+      - name: Apply all migrations to empty database
+        run: |
+          docker run --rm --network host \
+            -v ${{ github.workspace }}/sql:/flyway/sql \
+            -v ${{ github.workspace }}/flyway.conf:/flyway/conf/flyway.conf \
+            -e FLYWAY_URL -e FLYWAY_USER -e FLYWAY_PASSWORD \
+            redgate/flyway migrate
+
+  # Step 2: run the chosen Flyway command against the chosen environment.
+  deploy:
+    name: ${{ inputs.command }} on ${{ inputs.environment }}
+    needs: verify
+    # Set a repository variable RUNNER_LABEL (e.g. self-hosted-vpc) when the
+    # databases are private and only reachable from a runner inside your network.
+    runs-on: ${{ vars.RUNNER_LABEL || 'ubuntu-latest' }}
+    # Picks the GitHub Environment (dev / stage / prod). Each one holds its own
+    # DB_JDBC_URL, DB_USER and DB_PASSWORD secrets, and can require reviewers.
+    environment: ${{ inputs.environment }}
+    env:
+      FLYWAY_URL: ${{ secrets.DB_JDBC_URL }}
+      FLYWAY_USER: ${{ secrets.DB_USER }}
+      FLYWAY_PASSWORD: ${{ secrets.DB_PASSWORD }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Check environment secrets are set
+        run: |
+          for v in FLYWAY_URL FLYWAY_USER FLYWAY_PASSWORD; do
+            if [ -z "${!v}" ]; then
+              echo "::error::Secret for $v is empty. Add DB_JDBC_URL, DB_USER and DB_PASSWORD to the '${{ inputs.environment }}' environment."
+              exit 1
+            fi
+          done
+
+      - name: Flyway info (before)
+        run: |
+          docker run --rm \
+            -v ${{ github.workspace }}/sql:/flyway/sql \
+            -v ${{ github.workspace }}/flyway.conf:/flyway/conf/flyway.conf \
+            -e FLYWAY_URL -e FLYWAY_USER -e FLYWAY_PASSWORD \
+            redgate/flyway info
+
+      - name: Flyway ${{ inputs.command }}
+        if: inputs.command != 'info'
+        run: |
+          docker run --rm \
+            -v ${{ github.workspace }}/sql:/flyway/sql \
+            -v ${{ github.workspace }}/flyway.conf:/flyway/conf/flyway.conf \
+            -e FLYWAY_URL -e FLYWAY_USER -e FLYWAY_PASSWORD \
+            redgate/flyway ${{ inputs.command }}
+
+      - name: Flyway info (after)
+        if: inputs.command == 'migrate'
+        run: |
+          docker run --rm \
+            -v ${{ github.workspace }}/sql:/flyway/sql \
+            -v ${{ github.workspace }}/flyway.conf:/flyway/conf/flyway.conf \
+            -e FLYWAY_URL -e FLYWAY_USER -e FLYWAY_PASSWORD \
+            redgate/flyway info
