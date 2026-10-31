@@ -16,7 +16,7 @@ jobs:
     runs-on: ubuntu-latest
     # Create a GitHub Environment named "rds" (Settings > Environments) and add
     # required reviewers if you want an approval gate before this job runs.
-    environment: rds
+    environment: dev
     env:
       FLYWAY_URL: ${{ secrets.RDS_JDBC_URL }}
       FLYWAY_USER: ${{ secrets.RDS_USER }}
