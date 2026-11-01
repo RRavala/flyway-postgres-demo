@@ -1,7 +1,13 @@
-name: Flyway migrate (AWS RDS)
+name: Flyway migrate (pilot-test-pg)
 
-# Manual only. The CI workflow (flyway.yml) already proves migrations on a
-# throwaway container; this one applies them to the real RDS instance.
+# Manual only. Applies the migrations in sql/ to the RDS instance that the
+# pilot-infra repo creates. This repo never creates or destroys the database.
+#
+# No database secrets are stored in GitHub. The job:
+#   1. assumes the same AWS role pilot-infra uses (GitHub OIDC, no keys),
+#   2. looks up the instance endpoint and its master-password secret in AWS,
+#   3. allows this runner's IP on port 5432 for the length of the job only,
+#   4. runs Flyway, then removes the IP again (even if Flyway fails).
 on:
   workflow_dispatch:
     inputs:
@@ -9,25 +15,103 @@ on:
         description: Flyway command
         type: choice
         options: [info, validate, migrate]
-        default: migrate
+        default: info
+      db_identifier:
+        description: RDS instance identifier created by pilot-infra
+        type: string
+        default: pilot-test-pg
+      database:
+        description: Database name inside the instance
+        type: string
+        default: test
+
+permissions:
+  id-token: write
+  contents: read
+
+# One migration at a time against the shared pilot database.
+concurrency:
+  group: flyway-pilot-test-pg
+  cancel-in-progress: false
+
+env:
+  AWS_REGION: us-east-1
+  FLYWAY_IMAGE: redgate/flyway:latest # pin a version here once you settle on one
 
 jobs:
-  rds:
+  migrate:
     runs-on: ubuntu-latest
-    # Create a GitHub Environment named "rds" (Settings > Environments) and add
-    # required reviewers if you want an approval gate before this job runs.
-    environment: dev
-    env:
-      FLYWAY_URL: ${{ secrets.RDS_JDBC_URL }}
-      FLYWAY_USER: ${{ secrets.RDS_USER }}
-      FLYWAY_PASSWORD: ${{ secrets.RDS_PASSWORD }}
     steps:
       - uses: actions/checkout@v4
 
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars.AWS_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Wait for the database and look up its connection details
+        env:
+          DB_ID: ${{ inputs.db_identifier }}
+          DB_NAME: ${{ inputs.database }}
+        run: |
+          set -euo pipefail
+
+          # Fails fast with a clear message if pilot-infra has not applied (or was destroyed).
+          if ! aws rds describe-db-instances --db-instance-identifier "$DB_ID" >/dev/null 2>&1; then
+            echo "::error::RDS instance '$DB_ID' not found. Run 'apply' in the pilot-infra workflow first."
+            exit 1
+          fi
+          aws rds wait db-instance-available --db-instance-identifier "$DB_ID"
+
+          read -r ENDPOINT PORT DB_USER SG_ID SECRET_ARN < <(
+            aws rds describe-db-instances --db-instance-identifier "$DB_ID" \
+              --query 'DBInstances[0].[Endpoint.Address,Endpoint.Port,MasterUsername,VpcSecurityGroups[0].VpcSecurityGroupId,MasterUserSecret.SecretArn]' \
+              --output text
+          )
+
+          if [ -z "$SECRET_ARN" ] || [ "$SECRET_ARN" = "None" ]; then
+            echo "::error::'$DB_ID' has no RDS-managed master secret (restored from a snapshot?). Add a password source to this workflow."
+            exit 1
+          fi
+
+          PASSWORD="$(aws secretsmanager get-secret-value --secret-id "$SECRET_ARN" \
+            --query SecretString --output text | jq -r .password)"
+          echo "::add-mask::$PASSWORD"
+
+          {
+            echo "FLYWAY_URL=jdbc:postgresql://${ENDPOINT}:${PORT}/${DB_NAME}?sslmode=require"
+            echo "FLYWAY_USER=${DB_USER}"
+            echo "FLYWAY_PASSWORD=${PASSWORD}"
+            echo "SG_ID=${SG_ID}"
+            echo "DB_PORT=${PORT}"
+          } >> "$GITHUB_ENV"
+
+          echo "Target: ${ENDPOINT}:${PORT}/${DB_NAME} as ${DB_USER}" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Allow this runner on the database security group
+        run: |
+          set -euo pipefail
+          RUNNER_IP="$(curl -fsS https://checkip.amazonaws.com | tr -d '[:space:]')"
+          RUNNER_CIDR="${RUNNER_IP}/32"
+
+          aws ec2 authorize-security-group-ingress --group-id "$SG_ID" \
+            --ip-permissions "IpProtocol=tcp,FromPort=${DB_PORT},ToPort=${DB_PORT},IpRanges=[{CidrIp=${RUNNER_CIDR},Description=flyway-run-${{ github.run_id }}}]"
+
+          # Set only after the rule exists, so cleanup never revokes something we did not add.
+          echo "RUNNER_CIDR=${RUNNER_CIDR}" >> "$GITHUB_ENV"
+
       - name: Flyway ${{ inputs.command }}
+        env:
+          FLYWAY_COMMAND: ${{ inputs.command }}
         run: |
           docker run --rm \
-            -v ${{ github.workspace }}/sql:/flyway/sql \
-            -v ${{ github.workspace }}/flyway.conf:/flyway/conf/flyway.conf \
+            -v "${{ github.workspace }}/sql:/flyway/sql" \
+            -v "${{ github.workspace }}/flyway.conf:/flyway/conf/flyway.conf" \
             -e FLYWAY_URL -e FLYWAY_USER -e FLYWAY_PASSWORD \
-            redgate/flyway ${{ inputs.command }}
+            "$FLYWAY_IMAGE" -connectRetries=6 "$FLYWAY_COMMAND"
+
+      - name: Remove this runner from the security group
+        if: always() && env.RUNNER_CIDR != ''
+        run: |
+          aws ec2 revoke-security-group-ingress --group-id "$SG_ID" \
+            --protocol tcp --port "$DB_PORT" --cidr "$RUNNER_CIDR"
